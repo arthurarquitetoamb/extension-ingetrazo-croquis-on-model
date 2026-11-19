@@ -34,7 +34,10 @@ What it gives you:
   filled is closed for the fill only: the outline stays open, as drawn.
 * **Croquis on model eraser** — drag over strokes; they go on release, together.
 * **Layers** — as many as you like, each with a name, visibility, lock and
-  opacity, painted bottom to top. New strokes land on the active layer and
+  opacity, painted bottom to top. Named drawings appear beneath their layer
+  in the panel tree, listed top to bottom and draggable above or below one
+  another to change their stacking order. They can be selected there and have
+  independent visibility toggles. New strokes land on the active layer and
   the eraser only touches that layer.
 * **Export** — PNG (with a scale, transparent, white, dark or over the
   current view), SVG and the clipboard. A best-effort Sheet Composer bridge
@@ -58,40 +61,51 @@ import os
 import time
 import uuid
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import (
+    QItemSelectionModel,
+    QPointF,
+    QRectF,
+    Qt,
+    Signal,
+    QTimer,
+)
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QIcon,
     QImage,
+    QKeySequence,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
     QPolygonF,
+    QShortcut,
     QRadialGradient,
     QVector3D,
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSlider,
     QSpinBox,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -106,7 +120,7 @@ TITLE = "Croquis on model"
 
 #: Bumped when the document layout changes; version 1 kept a flat
 #: ``strokes`` list and is migrated on read.
-DOC_VERSION = 3
+DOC_VERSION = 5
 
 #: The pen's palette: the label the panel shows and the colour a stroke
 #: keeps for good.
@@ -177,6 +191,7 @@ SNAP_PX = 10.0
 #: Points closer than this on screen are dropped: a 60 Hz mouse would
 #: otherwise store a few hundred points per centimetre of line.
 MIN_STEP_PX = 2.5
+MAX_TRACE_SPACING_PX = 18.0
 #: A single stroke never keeps more than this many points.
 MAX_POINTS = 4000
 #: Fill opacity when a stroke is filled.
@@ -200,6 +215,8 @@ _SHAPE = {"kind": "line", "sides": 6}
 _BRUSH = {"color": "#3f7fd1", "width": 34.0, "soft": 0.75, "alpha": 0.55,
           "profile": "even", "jitter": 0.30,
           "color2": "", "grad": "off"}
+#: Higher trace speed skips more small movements for straighter freehand marks.
+_TRACE = {"speed": 0}
 
 #: How a filled shape is coloured: one colour, or from one to another.
 FILL_GRADIENTS = (
@@ -300,6 +317,11 @@ def _clean_stroke(raw) -> dict | None:
                    if point is not None]
         if len(contour) >= 3:
             contours.append(contour)
+    normal = _point(raw.get("normal"))
+    if normal is not None:
+        length = math.sqrt(sum(value * value for value in normal))
+        normal = (tuple(value / length for value in normal)
+                  if length > 1e-9 else None)
     try:
         width = float(raw.get("w", _PEN["width"]))
     except (TypeError, ValueError):
@@ -338,10 +360,13 @@ def _clean_stroke(raw) -> dict | None:
         brush_grad = "off"
     return {
         "id": str(raw.get("id") or ""),
+        "name": str(raw.get("name") or "")[:60],
+        "visible": bool(raw.get("visible", True)),
         "c": str(raw.get("c") or _PEN["color"]),
         "w": max(0.5, min(40.0, width)),
         "p": pts,
         "contours": contours,
+        "normal": normal,
         "kind": str(raw.get("kind") or "free"),
         "fc": str(raw.get("fc") or ""),
         "fc2": str(raw.get("fc2") or ""),
@@ -371,6 +396,38 @@ def new_layer(name: str = "Layer") -> dict:
     }
 
 
+def _name_stroke(layer: dict, stroke: dict) -> None:
+    """Give a drawing a stable, readable name within its layer."""
+    if str(stroke.get("name") or "").strip():
+        return
+    labels = {
+        "free": "Pen stroke",
+        "brush": "Brush stroke",
+        "line": "Line",
+        "polyline": "Polyline",
+        "rect": "Rectangle",
+        "ellipse": "Ellipse",
+        "circle": "Circle",
+        "arc": "Arc",
+        "polygon": "Polygon",
+        "star": "Star",
+        "boolean": "Combined shape",
+        "partial": "Partial stroke",
+    }
+    kind = str(stroke.get("kind") or "free")
+    base = labels.get(kind, kind.replace("_", " ").title() or "Stroke")
+    prefix = f"{base} "
+    highest = 0
+    for existing in layer["strokes"]:
+        name = str(existing.get("name") or "")
+        if name.startswith(prefix):
+            try:
+                highest = max(highest, int(name[len(prefix):]))
+            except ValueError:
+                continue
+    stroke["name"] = f"{base} {highest + 1}"
+
+
 def _clean_layer(raw, index: int) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -382,6 +439,7 @@ def _clean_layer(raw, index: int) -> dict | None:
     for st in _series(raw.get("strokes")):
         clean = _clean_stroke(st)
         if clean is not None:
+            _name_stroke({"strokes": strokes}, clean)
             strokes.append(clean)
     return {
         "id": str(raw.get("id") or uuid.uuid4().hex[:8]),
@@ -450,7 +508,9 @@ def _clean_doc(raw) -> dict:
                                  for s in _series(raw.get("strokes"))) if st]
             if old:
                 layer = new_layer("Annotations")
-                layer["strokes"] = old
+                for stroke in old:
+                    _name_stroke(layer, stroke)
+                    layer["strokes"].append(stroke)
                 layers.append(layer)
     if not layers:
         layers = [new_layer("Annotations")]
@@ -486,11 +546,16 @@ def _dump(doc) -> dict:
             "opacity": round(float(lay["opacity"]), 3),
             "strokes": [{
                 "id": s["id"],
+                "name": s["name"],
+                "visible": bool(s.get("visible", True)),
                 "c": s["c"],
                 "fc": str(s.get("fc") or ""),
                 "fc2": str(s.get("fc2") or ""),
                 "fg": str(s.get("fg") or "solid"),
                 "fp": str(s.get("fp") or "solid"),
+                "normal": (None if s.get("normal") is None
+                           else [round(value, 6)
+                                 for value in s["normal"]]),
                 "contours": [[[round(x, 4), round(y, 4), round(z, 4)]
                                for x, y, z in contour]
                               for contour in (s.get("contours") or [])],
@@ -551,12 +616,18 @@ def writable_layer(app, scene) -> dict | None:
 
 
 def all_strokes(app, scene=None) -> list:
-    """Every stroke of every layer, bottom to top (for snapping)."""
+    """Every visible stroke, bottom to top (for snapping)."""
     out = []
     for lay in document(app, scene)["layers"]:
         if lay["visible"]:
-            out.extend(lay["strokes"])
+            out.extend(_visible_strokes(lay))
     return out
+
+
+def _visible_strokes(layer: dict) -> list:
+    """The drawings enabled individually within a layer."""
+    return [stroke for stroke in layer["strokes"]
+            if stroke.get("visible", True)]
 
 
 def strokes_of(app, scene=None) -> list:
@@ -568,12 +639,18 @@ def total_strokes(app, scene=None) -> int:
     return sum(len(lay["strokes"]) for lay in document(app, scene)["layers"])
 
 
+def _trace_spacing_px() -> float:
+    speed = max(0.0, min(100.0, float(_TRACE["speed"]))) / 100.0
+    return MIN_STEP_PX + (MAX_TRACE_SPACING_PX - MIN_STEP_PX) * speed
+
+
 def _append_stroke(app, scene, stroke) -> bool:
     """Add ``stroke`` to the active layer and commit it, or say why not."""
     doc = document(app, scene)
     layer = active_layer(doc)
     if layer["locked"] or not layer["visible"]:
         return False
+    _name_stroke(layer, stroke)
     layer["strokes"].append(stroke)
     _store(app, doc)
     return True
@@ -1273,7 +1350,7 @@ def _paint_layers(painter, viewport, doc, scale: float = 1.0) -> None:
         if not lay["visible"] or not lay["strokes"]:
             continue
         painter.setOpacity(max(0.0, min(1.0, float(lay["opacity"]))))
-        for st in lay["strokes"]:
+        for st in _visible_strokes(lay):
             contours = _stroke_world_contours(st)
             projected = [_project(viewport, contour) for contour in contours]
             _paint_stroke(painter, projected[0], st, scale,
@@ -1339,7 +1416,7 @@ def _pick(viewport, strokes, sx, sy, skip=()):
     """
     best, best_score = None, 1.0
     for st in strokes:
-        if st["id"] in skip:
+        if not st.get("visible", True) or st["id"] in skip:
             continue
         reach = PICK_PX
         if float(st.get("soft") or 0.0) > 0.01:
@@ -1672,6 +1749,9 @@ class _StickyTool(Tool):
     shortcut = None
     uses_snap = False
 
+    def draw_overlay(self, viewport, painter: QPainter) -> None:
+        """Preview is painted last by the extension overlay."""
+
     def __init__(self) -> None:
         self._entering = False
 
@@ -1692,9 +1772,9 @@ class _StickyTool(Tool):
 
 
 def _stroke_dict(points, kind: str, closed: bool, smooth: int,
-                 turbulence: float = 0.0) -> dict:
+                 turbulence: float = 0.0, normal=None) -> dict:
     """A stroke as the document keeps it."""
-    return {
+    stroke = {
         "id": uuid.uuid4().hex[:12],
         "c": _PEN["color"],
         "fc": str(_PEN["fill_color"] or ""),
@@ -1711,6 +1791,11 @@ def _stroke_dict(points, kind: str, closed: bool, smooth: int,
         "a": 1.0,
         "jt": max(0.0, min(1.0, float(turbulence))),
     }
+    if normal is not None and normal.length() > 1e-9:
+        unit = normal.normalized()
+        stroke["normal"] = (float(unit.x()), float(unit.y()),
+                           float(unit.z()))
+    return stroke
 
 
 class ScribbleTool(_StickyTool):
@@ -1729,6 +1814,7 @@ class ScribbleTool(_StickyTool):
         self._plane = None
         self._normal = None
         self._last_px = None
+        self._pending_point = None
         self._stroke_id = None
 
     # ---- Input -------------------------------------------------------------
@@ -1766,16 +1852,23 @@ class ScribbleTool(_StickyTool):
         ctx.viewport.update()
 
     def on_release(self, viewport) -> None:
-        points, self._points = self._points, []
+        points = list(self._points)
+        if (self._pending_point is not None and len(points) < MAX_POINTS
+                and (not points
+                     or (points[-1] - self._pending_point).lengthSquared()
+                     >= 1e-8)):
+            points.append(self._pending_point)
+        self._points = []
         stroke_id, self._stroke_id = self._stroke_id, None
+        normal, self._normal = self._normal, None
         self._plane = None
-        self._normal = None
         self._last_px = None
+        self._pending_point = None
         if len(points) < 2 or _APP is None:
             viewport.update()
             return
         try:
-            stroke = self._new_stroke(points)
+            stroke = self._new_stroke(points, normal=normal)
             if stroke_id:
                 stroke["id"] = stroke_id
             if not _append_stroke(_APP, viewport.scene, stroke):
@@ -1792,20 +1885,22 @@ class ScribbleTool(_StickyTool):
         viewport.update()
 
     # ---- Drawing -----------------------------------------------------------
-    def draw_overlay(self, viewport, painter: QPainter) -> None:
+    def draw_preview(self, viewport, painter: QPainter) -> None:
         """The stroke being drawn, over the committed ones."""
-        if len(self._points) < 2:
+        points = self._preview_points()
+        if len(points) < 2:
             return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         _paint_stroke(painter, _project(
-            viewport, [(p.x(), p.y(), p.z()) for p in self._points]),
+            viewport, [(p.x(), p.y(), p.z()) for p in points]),
             self._overlay_stroke())
 
     # ---- What this tool lays down ------------------------------------------
-    def _new_stroke(self, points) -> dict:
+    def _new_stroke(self, points, normal=None) -> dict:
         """The stroke a drag becomes; the brush overrides this."""
         return _stroke_dict(points, "free", bool(_PEN["fill"]), PEN_SMOOTH,
-                            turbulence=float(_PEN["turbulence"]))
+                            turbulence=float(_PEN["turbulence"]),
+                            normal=normal)
 
     def _overlay_stroke(self) -> dict:
         """The stroke being drawn, as the overlay paints it."""
@@ -1823,23 +1918,37 @@ class ScribbleTool(_StickyTool):
     # ---- Internals ---------------------------------------------------------
     def _add(self, ctx: ToolContext) -> None:
         sx, sy = ctx.screen.x(), ctx.screen.y()
-        if self._last_px is not None:
-            if abs(sx - self._last_px[0]) + abs(sy - self._last_px[1]) \
-                    < MIN_STEP_PX:
-                return
-        if len(self._points) >= MAX_POINTS:
-            return
+        spacing = _trace_spacing_px()
         point = QVector3D(ctx.world)
         if self._points and (self._points[-1] - point).lengthSquared() < 1e-8:
+            self._pending_point = None
+            return
+        if self._last_px is not None and \
+                abs(sx - self._last_px[0]) + abs(sy - self._last_px[1]) \
+                < spacing:
+            self._pending_point = point
+            return
+        if len(self._points) >= MAX_POINTS:
             return
         self._last_px = (sx, sy)
+        self._pending_point = None
         self._points.append(point)
+
+    def _preview_points(self):
+        points = list(self._points)
+        if (self._pending_point is not None and len(points) < MAX_POINTS
+                and (not points
+                     or (points[-1] - self._pending_point).lengthSquared()
+                     >= 1e-8)):
+            points.append(self._pending_point)
+        return points
 
     def _forget(self) -> None:
         self._points = []
         self._plane = None
         self._normal = None
         self._last_px = None
+        self._pending_point = None
         self._stroke_id = None
 
 
@@ -1858,8 +1967,25 @@ class ScribbleBrushTool(ScribbleTool):
     uses_snap = False
     qt_cursor = Qt.CursorShape.CrossCursor
 
-    def _new_stroke(self, points) -> dict:
-        return {
+    def draw_preview(self, viewport, painter: QPainter) -> None:
+        points = self._preview_points()
+        if len(points) < 2:
+            return
+        stroke = self._overlay_stroke()
+        stroke["p"] = [(point.x(), point.y(), point.z())
+                       for point in points]
+        stroke = _clean_stroke(stroke)
+        if stroke is None:
+            return
+        layer = active_layer(document(_APP, viewport.scene)) if _APP else None
+        painter.save()
+        painter.setOpacity(float(layer["opacity"]) if layer else 1.0)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        _paint_stroke(painter, _project(viewport, stroke["p"]), stroke)
+        painter.restore()
+
+    def _new_stroke(self, points, normal=None) -> dict:
+        stroke = {
             "id": uuid.uuid4().hex[:12],
             "c": str(_BRUSH["color"]),
             "fc": "",
@@ -1877,6 +2003,11 @@ class ScribbleBrushTool(ScribbleTool):
             "c2": str(_BRUSH["color2"] or ""),
             "bg": str(_BRUSH["grad"] or "off"),
         }
+        if normal is not None and normal.length() > 1e-9:
+            unit = normal.normalized()
+            stroke["normal"] = (float(unit.x()), float(unit.y()),
+                                float(unit.z()))
+        return stroke
 
     def _overlay_stroke(self) -> dict:
         return {"c": _BRUSH["color"], "fc": "",
@@ -1884,8 +2015,10 @@ class ScribbleBrushTool(ScribbleTool):
                 "fill": 0.0, "closed": False, "smooth": 2,
                 "soft": float(_BRUSH["soft"]),
                 "a": float(_BRUSH["alpha"]),
+                "kind": "brush",
                 "pf": str(_BRUSH["profile"] or "even"),
                 "jt": float(_BRUSH["jitter"]),
+                "id": self._stroke_id or "draft",
                 "c2": str(_BRUSH["color2"] or ""),
                 "bg": str(_BRUSH["grad"] or "off")}
 
@@ -1986,7 +2119,7 @@ class ScribbleShapeTool(_StickyTool):
         self._finish(viewport)
 
     # ---- Drawing -----------------------------------------------------------
-    def draw_overlay(self, viewport, painter: QPainter) -> None:
+    def draw_preview(self, viewport, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         pts = list(self._pts)
         if self._hover is not None and pts:
@@ -2038,7 +2171,7 @@ class ScribbleShapeTool(_StickyTool):
         kind = str(_SHAPE["kind"])
         try:
             poly, closed = shape_points(kind, pts, normal, int(_SHAPE["sides"]))
-            stroke = _stroke_dict(poly, kind, closed, 0)
+            stroke = _stroke_dict(poly, kind, closed, 0, normal=normal)
             if not _append_stroke(_APP, viewport.scene, stroke):
                 _hint(viewport, "Croquis on model: this layer is hidden or locked",
                       6000)
@@ -2234,13 +2367,17 @@ class ScribbleEraserTool(_StickyTool):
                 revised = []
                 changed = 0
                 for stroke in layer["strokes"]:
-                    if stroke["id"] not in doomed:
+                    if (stroke["id"] not in doomed
+                            or not stroke.get("visible", True)):
                         revised.append(stroke)
                         continue
                     pieces, cut = _partial_erase_stroke(stroke, viewport,
                                                         erase_path)
                     if cut:
-                        revised.extend(pieces)
+                        for piece in pieces:
+                            piece.pop("name", None)
+                            _name_stroke({"strokes": revised}, piece)
+                            revised.append(piece)
                         changed += 1
                     else:
                         revised.append(stroke)
@@ -2251,7 +2388,8 @@ class ScribbleEraserTool(_StickyTool):
             else:
                 before = len(layer["strokes"])
                 layer["strokes"] = [st for st in layer["strokes"]
-                                    if st["id"] not in doomed]
+                                    if st["id"] not in doomed
+                                    or not st.get("visible", True)]
                 if len(layer["strokes"]) == before:
                     viewport.update()
                     return
@@ -2266,7 +2404,7 @@ class ScribbleEraserTool(_StickyTool):
         viewport.update()
 
     # ---- Drawing -----------------------------------------------------------
-    def draw_overlay(self, viewport, painter: QPainter) -> None:
+    def draw_preview(self, viewport, painter: QPainter) -> None:
         """Preview either removed marks or the swept partial-erase capsule."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if self._stroke and self._partial and self._path:
@@ -2289,7 +2427,7 @@ class ScribbleEraserTool(_StickyTool):
             return
         for st in document(_APP, viewport.scene)["layers"]:
             for stroke in st["strokes"]:
-                if stroke["id"] in self._doomed:
+                if stroke.get("visible", True) and stroke["id"] in self._doomed:
                     contours = [_project(viewport, contour)
                                 for contour in _stroke_world_contours(stroke)]
                     _paint_stroke(painter, contours[0],
@@ -2320,6 +2458,8 @@ class ScribbleEraserTool(_StickyTool):
 _MOVE_ACCENT = "#3b82f6"
 #: Selection survives switching between Select, Move, and drawing tools.
 _SELECTION = {"scene": None, "ids": set()}
+#: Selected vertices survive tool re-activation, but belong to one stroke.
+_POINT_SELECTION = {"scene": None, "stroke": None, "indices": set()}
 #: Whole-stroke erasing remains the default; the checkbox enables partial cuts.
 _ERASER_MODE = {"partial": False}
 
@@ -2509,7 +2649,7 @@ class ScribbleMoveTool(_StickyTool):
             return
         whole = bool(_modifiers() & Qt.KeyboardModifier.ShiftModifier)
         if whole:
-            self._ids = {st["id"] for st in layer["strokes"]}
+            self._ids = {st["id"] for st in _visible_strokes(layer)}
             self._sel = set(self._ids)
         elif found in self._sel:
             self._ids = set(self._sel)      # the whole fence travels
@@ -2551,7 +2691,7 @@ class ScribbleMoveTool(_StickyTool):
                 return
             moved = 0
             for stroke in layer["strokes"]:
-                if stroke["id"] in ids:
+                if stroke.get("visible", True) and stroke["id"] in ids:
                     shift = lambda contour: [(x + delta.x(), y + delta.y(),
                                               z + delta.z())
                                              for x, y, z in contour]
@@ -2591,7 +2731,8 @@ class ScribbleMoveTool(_StickyTool):
         layer = active_layer(doc)
         if layer["locked"] or not layer["visible"]:
             return 0, "The active layer is hidden or locked."
-        selected = [st for st in layer["strokes"] if st["id"] in self._sel]
+        selected = [st for st in _visible_strokes(layer)
+                    if st["id"] in self._sel]
         if not selected:
             return 0, "Select marks first with Move's selection fence."
         points = [point for st in selected
@@ -2641,7 +2782,7 @@ class ScribbleMoveTool(_StickyTool):
         return len(selected), ""
 
     # ---- Drawing -----------------------------------------------------------
-    def draw_overlay(self, viewport, painter: QPainter) -> None:
+    def draw_preview(self, viewport, painter: QPainter) -> None:
         """Draw a clear selection outline, handles, and the drag preview."""
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if self._band_from is not None:
@@ -2663,6 +2804,8 @@ class ScribbleMoveTool(_StickyTool):
         selection_points = []
         painter.save()
         for stroke in layer["strokes"]:
+            if not stroke.get("visible", True):
+                continue
             selected = stroke["id"] in self._sel
             dragged = moving and stroke["id"] in self._ids
             if not selected and not dragged:
@@ -2747,6 +2890,8 @@ class ScribbleMoveTool(_StickyTool):
         layer = active_layer(document(_APP, viewport.scene))
         picked = set()
         for stroke in layer["strokes"]:
+            if not stroke.get("visible", True):
+                continue
             hit = False
             for contour in _stroke_world_contours(stroke):
                 pts = _project(viewport, contour)
@@ -2811,6 +2956,466 @@ class ScribbleSelectTool(ScribbleMoveTool):
     def on_release(self, viewport) -> None:
         if self._band_from is not None:
             self._close_band(viewport)
+
+
+def _selected_stroke(doc, stroke_id):
+    for layer in doc["layers"]:
+        for stroke in layer["strokes"]:
+            if stroke["id"] == stroke_id:
+                return layer, stroke
+    return None, None
+
+
+def _point_plane(stroke, viewport):
+    points = _stroke_world_contours(stroke)
+    if not points or not points[0]:
+        return None
+    origin = QVector3D(*points[0][0])
+    normal = stroke.get("normal")
+    normal = QVector3D(*normal) if normal else _normal_from_points(points[0])
+    if normal is None or normal.length() < 1e-9:
+        normal = _view_normal(viewport)
+    if normal is None or normal.length() < 1e-9:
+        return None
+    return origin, normal.normalized()
+
+
+def _move_stroke_points(stroke, indices, delta):
+    """Return a copy with selected contour vertices translated."""
+    moved = dict(stroke)
+    contours = stroke.get("contours") or []
+    if contours:
+        moved["contours"] = [list(contour) for contour in contours]
+        for contour_index, point_index in indices:
+            if (0 <= contour_index < len(moved["contours"])
+                    and 0 <= point_index < len(moved["contours"][contour_index])):
+                x, y, z = moved["contours"][contour_index][point_index]
+                moved["contours"][contour_index][point_index] = (
+                    x + delta.x(), y + delta.y(), z + delta.z())
+        moved["p"] = list(moved["contours"][0])
+    else:
+        moved["p"] = list(stroke["p"])
+        for contour_index, point_index in indices:
+            if contour_index == 0 and 0 <= point_index < len(moved["p"]):
+                x, y, z = moved["p"][point_index]
+                moved["p"][point_index] = (
+                    x + delta.x(), y + delta.y(), z + delta.z())
+    return moved
+
+
+class ScribblePointEditTool(_StickyTool):
+    """Select stroke vertices with a window, then drag to move those vertices."""
+
+    name = "Croquis on model point editing"
+    description = ("Drag a window to select points; drag again to move them "
+                   "in the drawing plane. Shift adds points.")
+    uses_snap = False
+    qt_cursor = Qt.CursorShape.CrossCursor
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stroke_id = None
+        self._band_from = None
+        self._band_to = None
+        self._additive = False
+        self._move_start = None
+        self._move_last = None
+        self._move_indices = set()
+
+    def _selected_id(self, scene):
+        if (_SELECTION["scene"] != id(scene)
+                or len(_SELECTION["ids"]) != 1):
+            return None
+        return next(iter(_SELECTION["ids"]))
+
+    def _get_stroke(self, scene):
+        if _APP is None:
+            return None, None
+        return _selected_stroke(document(_APP, scene),
+                                self._selected_id(scene))
+
+    def drag_plane(self, viewport):
+        stroke = self._get_stroke(viewport.scene)[1]
+        if stroke is None:
+            return None
+        plane = _point_plane(stroke, viewport)
+        return plane
+
+    def on_click(self, ctx: ToolContext) -> None:
+        if _APP is None:
+            return
+        selected_id = self._selected_id(ctx.viewport.scene)
+        if selected_id is None:
+            _hint(ctx.viewport, "Select one drawing in Layers before editing points.")
+            return
+        layer, stroke = _selected_stroke(document(_APP, ctx.viewport.scene),
+                                         selected_id)
+        if stroke is None or not stroke.get("visible", True) or not layer["visible"]:
+            _hint(ctx.viewport, "The selected drawing is hidden.")
+            return
+        if layer["locked"]:
+            _hint(ctx.viewport, "The selected layer is locked.", 4000)
+            return
+        if not any(_stroke_world_contours(stroke)):
+            _hint(ctx.viewport, "The selected drawing has no editable points.")
+            return
+
+        same_selection = (
+            _POINT_SELECTION["scene"] == id(ctx.viewport.scene)
+            and _POINT_SELECTION["stroke"] == selected_id
+            and bool(_POINT_SELECTION["indices"]))
+        additive = bool(_modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        self._stroke_id = selected_id
+        if same_selection and not additive:
+            self._move_indices = set(_POINT_SELECTION["indices"])
+            self._move_start = QVector3D(ctx.world)
+            self._move_last = QVector3D(ctx.world)
+        else:
+            self._band_from = (ctx.screen.x(), ctx.screen.y())
+            self._band_to = self._band_from
+            self._additive = additive
+        ctx.viewport.update()
+
+    def on_hover(self, ctx: ToolContext) -> None:
+        if self._band_from is not None:
+            self._band_to = (ctx.screen.x(), ctx.screen.y())
+            ctx.viewport.update()
+        elif self._move_start is not None:
+            self._move_last = QVector3D(ctx.world)
+            ctx.viewport.update()
+
+    def on_release(self, viewport) -> None:
+        if self._band_from is not None:
+            self._select_points(viewport)
+        elif self._move_start is not None:
+            self._commit_move(viewport)
+
+    def on_cancel(self, viewport) -> None:
+        self._forget()
+        _POINT_SELECTION.update(scene=None, stroke=None, indices=set())
+        viewport.update()
+
+    def draw_preview(self, viewport, painter: QPainter) -> None:
+        if _APP is None:
+            return
+        scene_id = id(viewport.scene)
+        stroke_id = self._stroke_id
+        if (stroke_id is None and _POINT_SELECTION["scene"] == scene_id
+                and _SELECTION["scene"] == scene_id
+                and _POINT_SELECTION["stroke"] in _SELECTION["ids"]):
+            stroke_id = _POINT_SELECTION["stroke"]
+        if stroke_id is None:
+            return
+        stroke = _selected_stroke(document(_APP, viewport.scene), stroke_id)[1]
+        if stroke is None:
+            return
+        indices = (_POINT_SELECTION["indices"]
+                   if _POINT_SELECTION["scene"] == scene_id
+                   and _POINT_SELECTION["stroke"] == stroke_id else set())
+        delta = (self._move_last - self._move_start
+                 if self._move_start is not None and self._move_last is not None
+                 else QVector3D())
+        preview = (_move_stroke_points(stroke, indices, delta)
+                   if indices and delta.lengthSquared() > 1e-12 else stroke)
+        contours = [_project(viewport, contour)
+                    for contour in _stroke_world_contours(preview)]
+        moving = bool(indices) and delta.lengthSquared() > 1e-12
+        if contours and moving:
+            _paint_stroke(painter, contours[0], preview,
+                          extra_contours=contours[1:])
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor("#ffffff"), 1.0))
+        painter.setBrush(QBrush(QColor(_MOVE_ACCENT)))
+        for contour_index, contour in enumerate(_stroke_world_contours(preview)):
+            projected = _project(viewport, contour)
+            for point_index, (x, y, front) in enumerate(projected):
+                if front and (contour_index, point_index) in indices:
+                    painter.drawEllipse(QPointF(x, y), 4.0, 4.0)
+        painter.restore()
+        if self._band_from is not None:
+            x0, y0 = self._band_from
+            x1, y1 = self._band_to or self._band_from
+            left, right = min(x0, x1), max(x0, x1)
+            top, bottom = min(y0, y1), max(y0, y1)
+            painter.setPen(QPen(QColor(_MOVE_ACCENT), 1.0,
+                                Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRectF(left, top, right - left, bottom - top))
+
+    def _select_points(self, viewport) -> None:
+        start, end = self._band_from, self._band_to or self._band_from
+        stroke_id = self._stroke_id
+        additive = self._additive
+        self._forget()
+        if start is None or end is None or _APP is None:
+            return
+        left, right = min(start[0], end[0]), max(start[0], end[0])
+        top, bottom = min(start[1], end[1]), max(start[1], end[1])
+        if right - left < 2.0 and bottom - top < 2.0:
+            if not additive:
+                _POINT_SELECTION.update(scene=None, stroke=None, indices=set())
+            viewport.update()
+            return
+        stroke = _selected_stroke(document(_APP, viewport.scene), stroke_id)[1]
+        if stroke is None:
+            viewport.update()
+            return
+        selected = set()
+        for contour_index, contour in enumerate(_stroke_world_contours(stroke)):
+            for point_index, (x, y, front) in enumerate(_project(viewport, contour)):
+                if front and _inside_box(x, y, left, top, right, bottom):
+                    selected.add((contour_index, point_index))
+        if additive and _POINT_SELECTION["scene"] == id(viewport.scene) \
+                and _POINT_SELECTION["stroke"] == stroke_id:
+            selected |= set(_POINT_SELECTION["indices"])
+        _POINT_SELECTION.update(scene=id(viewport.scene), stroke=stroke_id,
+                                indices=selected)
+        _hint(viewport, f"Croquis on model: {len(selected)} point(s) selected"
+              if selected else "Croquis on model: no points inside the window")
+        viewport.update()
+
+    def _commit_move(self, viewport) -> None:
+        stroke_id = self._stroke_id
+        indices = set(self._move_indices)
+        delta = (self._move_last - self._move_start
+                 if self._move_last is not None and self._move_start is not None
+                 else None)
+        self._forget()
+        if not indices or delta is None or delta.lengthSquared() < 1e-12 \
+                or _APP is None:
+            viewport.update()
+            return
+        try:
+            doc = document(_APP, viewport.scene)
+            layer, stroke = _selected_stroke(doc, stroke_id)
+            if stroke is None:
+                _hint(viewport, "The selected drawing no longer exists.", 4000)
+                return
+            if layer["locked"] or not layer["visible"] \
+                    or not stroke.get("visible", True):
+                _hint(viewport, "The selected drawing is hidden or locked.", 4000)
+                return
+            moved = _move_stroke_points(stroke, indices, delta)
+            layer["strokes"] = [
+                moved if item["id"] == stroke_id else item
+                for item in layer["strokes"]]
+            _store(_APP, doc)
+        except Exception as exc:  # noqa: BLE001
+            _fail(viewport, exc)
+            viewport.update()
+            return
+        _hint(viewport, f"Croquis on model: moved {len(indices)} point(s)")
+        viewport.update()
+
+    def _forget(self) -> None:
+        self._stroke_id = None
+        self._band_from = None
+        self._band_to = None
+        self._additive = False
+        self._move_start = None
+        self._move_last = None
+        self._move_indices = set()
+
+
+def _zoom_window(viewport, bounds) -> None:
+    """Frame a screen-space rectangle, respecting the camera's current view."""
+    camera = getattr(viewport, "camera", None)
+    if camera is None:
+        raise RuntimeError("The viewport camera is unavailable.")
+    x0, y0, x1, y1 = bounds
+    width, height = float(viewport.width()), float(viewport.height())
+    rect_width, rect_height = x1 - x0, y1 - y0
+    if rect_width < 4.0 or rect_height < 4.0:
+        _hint(viewport, "Drag a larger window to zoom.")
+        return
+    if width <= 0.0 or height <= 0.0:
+        raise RuntimeError("The viewport has no usable size.")
+
+    forward = _view_normal(viewport)
+    if forward is None:
+        raise RuntimeError("The camera direction is unavailable.")
+    up_hint = getattr(camera, "up", QVector3D(0.0, 0.0, 1.0))
+    if callable(up_hint):
+        up_hint = up_hint()
+    up_hint = QVector3D(up_hint)
+    right = QVector3D.crossProduct(forward, up_hint)
+    if right.length() < 1e-8:
+        right = QVector3D.crossProduct(
+            forward, QVector3D(0.0, 1.0, 0.0))
+    if right.length() < 1e-8:
+        raise RuntimeError("Could not determine the camera screen axes.")
+    right.normalize()
+    up = QVector3D.crossProduct(right, forward).normalized()
+
+    target = QVector3D(camera.target)
+    target_xyz = (target.x(), target.y(), target.z())
+    projected = _project(viewport, [
+        target_xyz,
+        (target.x() + right.x(), target.y() + right.y(), target.z() + right.z()),
+        (target.x() + up.x(), target.y() + up.y(), target.z() + up.z()),
+    ])
+    if not all(point[2] for point in projected):
+        raise RuntimeError("Could not project the zoom window onto the camera.")
+    p0, pr, pu = projected
+    a, b = pr[0] - p0[0], pu[0] - p0[0]
+    c, d = pr[1] - p0[1], pu[1] - p0[1]
+    determinant = a * d - b * c
+    if abs(determinant) < 1e-10:
+        raise RuntimeError("The camera projection cannot frame this window.")
+    dx_screen = (x0 + x1) * 0.5 - p0[0]
+    dy_screen = (y0 + y1) * 0.5 - p0[1]
+    right_amount = (dx_screen * d - b * dy_screen) / determinant
+    up_amount = (a * dy_screen - dx_screen * c) / determinant
+    shift = right * right_amount + up * up_amount
+
+    distance = float(camera.distance)
+    fov = float(getattr(camera, "fov_deg", 45.0))
+    if distance <= 0.0 or not 0.0 < fov < 180.0:
+        raise RuntimeError("The camera zoom settings are invalid.")
+    factor = max(rect_width / width, rect_height / height) * 1.08
+    new_target = target + shift
+    try:
+        floor = float(camera.min_distance(new_target))
+    except Exception:  # noqa: BLE001 — older camera API
+        floor = 0.01
+    camera.target = new_target
+    if hasattr(camera, "oblique_pivot"):
+        camera.oblique_pivot = QVector3D(camera.oblique_pivot) + shift
+    camera.distance = max(0.01, min(10000.0, distance * factor))
+    camera.distance = max(camera.distance, floor)
+    viewport.update()
+
+
+def _fit_camera_points(viewport, points) -> bool:
+    points = [point for point in points
+              if all(math.isfinite(value) for value in point)]
+    if not points:
+        return False
+    camera = getattr(viewport, "camera", None)
+    fit_to = getattr(camera, "fit_to", None)
+    if not callable(fit_to):
+        raise RuntimeError("The camera does not support framing drawings.")
+    minimum = [min(point[axis] for point in points) for axis in range(3)]
+    maximum = [max(point[axis] for point in points) for axis in range(3)]
+    for axis in range(3):
+        if maximum[axis] - minimum[axis] < 0.01:
+            centre = (minimum[axis] + maximum[axis]) * 0.5
+            minimum[axis], maximum[axis] = centre - 0.005, centre + 0.005
+    fit_to(QVector3D(*minimum), QVector3D(*maximum), 1.3)
+    viewport.update()
+    return True
+
+
+def _zoom_extents(app, viewport) -> None:
+    """Fit the camera to all individually and layer-visible annotations."""
+    if not _SHOW["visible"]:
+        _hint(viewport, "Show annotations before using Zoom Extents.")
+        return
+    points = [
+        point
+        for stroke in all_strokes(app, viewport.scene)
+        for contour in _stroke_world_contours(stroke)
+        for point in contour
+    ]
+    if not _fit_camera_points(viewport, points):
+        _hint(viewport, "No visible Croquis annotations to frame.")
+
+
+def _zoom_object(app, viewport) -> None:
+    scene = getattr(viewport, "scene", None)
+    if scene is None or _SELECTION["scene"] != id(scene) \
+            or not _SELECTION["ids"]:
+        _hint(viewport, "Select a drawing in Layers before using Zoom Object.")
+        return
+    selected = [
+        stroke
+        for layer in document(app, scene)["layers"]
+        for stroke in layer["strokes"]
+        if stroke["id"] in _SELECTION["ids"]
+    ]
+    points = [
+        point
+        for stroke in selected
+        for contour in _stroke_world_contours(stroke)
+        for point in contour
+    ]
+    if not _fit_camera_points(viewport, points):
+        _hint(viewport, "The selected drawing has no points to frame.")
+
+
+def _zoom_extents_action(app) -> None:
+    viewport = getattr(app, "viewport", None)
+    if viewport is None:
+        return
+    try:
+        _zoom_extents(app, viewport)
+    except Exception as exc:  # noqa: BLE001 — surfaced in the viewport
+        _fail(viewport, exc)
+
+
+def _zoom_object_action(app) -> None:
+    viewport = getattr(app, "viewport", None)
+    if viewport is None:
+        return
+    try:
+        _zoom_object(app, viewport)
+    except Exception as exc:  # noqa: BLE001 — surfaced in the viewport
+        _fail(viewport, exc)
+
+
+class ScribbleZoomWindowTool(_StickyTool):
+    """Zoom to a viewport rectangle."""
+
+    name = "Croquis on model zoom window"
+    description = "Drag a rectangle to zoom the viewport into that area."
+    uses_snap = False
+    qt_cursor = Qt.CursorShape.CrossCursor
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._start = None
+        self._end = None
+
+    def on_click(self, ctx: ToolContext) -> None:
+        self._start = (ctx.screen.x(), ctx.screen.y())
+        self._end = self._start
+        ctx.viewport.update()
+
+    def on_hover(self, ctx: ToolContext) -> None:
+        if self._start is not None:
+            self._end = (ctx.screen.x(), ctx.screen.y())
+            ctx.viewport.update()
+
+    def on_release(self, viewport) -> None:
+        if self._start is None or self._end is None:
+            return
+        x0, x1 = sorted((self._start[0], self._end[0]))
+        y0, y1 = sorted((self._start[1], self._end[1]))
+        self._forget()
+        try:
+            _zoom_window(viewport, (x0, y0, x1, y1))
+        except Exception as exc:  # noqa: BLE001 — surfaced in the viewport
+            _fail(viewport, exc)
+        viewport.update()
+
+    def on_cancel(self, viewport) -> None:
+        self._forget()
+        viewport.update()
+
+    def draw_preview(self, viewport, painter: QPainter) -> None:
+        if self._start is None or self._end is None:
+            return
+        x0, x1 = sorted((self._start[0], self._end[0]))
+        y0, y1 = sorted((self._start[1], self._end[1]))
+        painter.setPen(QPen(QColor(_MOVE_ACCENT), 1.2,
+                            Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+
+    def _forget(self) -> None:
+        self._start = None
+        self._end = None
 
 
 # ---------------------------------------------------------------------------
@@ -3009,6 +3614,8 @@ def svg_text(app=None, viewport=None, scene=None, size=None,
             out.append(f'<g id="{_sanitize(layer["name"])}" '
                        f'opacity="{float(layer["opacity"]):.3f}">')
             for stroke in layer["strokes"]:
+                if not stroke.get("visible", True):
+                    continue
                 projected = [_project(viewport, contour)
                              for contour in _stroke_world_contours(stroke)]
                 if not projected or not projected[0]:
@@ -3320,6 +3927,104 @@ class DrawingPlaneDialog(QDialog):
         return origin, normal, size
 
 
+class _StrokeOrderTree(QTreeWidget):
+    orderChanged = Signal()
+
+    def _internal_drag(self, event) -> bool:
+        return event.source() is self and len(self.selectedItems()) == 1
+
+    def dragEnterEvent(self, event) -> None:
+        if self._internal_drag(event):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self._internal_drag(event):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            super().dragMoveEvent(event)
+
+    def _move_item(self, item, target, lower_half: bool,
+                   on_item: bool) -> bool:
+        if item is None or target is None or item is target:
+            return False
+        kind = item.data(0, Qt.ItemDataRole.UserRole)
+        target_kind = target.data(0, Qt.ItemDataRole.UserRole)
+
+        if kind == "layer":
+            if target_kind != "layer":
+                return False
+            self.takeTopLevelItem(self.indexOfTopLevelItem(item))
+            index = self.indexOfTopLevelItem(target)
+            if index < 0:
+                self.addTopLevelItem(item)
+            else:
+                if lower_half and not on_item:
+                    index += 1
+                self.insertTopLevelItem(index, item)
+        elif kind == "stroke":
+            parent = item.parent()
+            if parent is None:
+                return False
+            if target_kind == "stroke":
+                dest = target.parent()
+                if dest is None:
+                    return False
+                parent.takeChild(parent.indexOfChild(item))
+                index = dest.indexOfChild(target)
+                if lower_half:
+                    index += 1
+                dest.insertChild(index, item)
+            elif target_kind == "layer":
+                dest = target
+                parent.takeChild(parent.indexOfChild(item))
+                if on_item:
+                    dest.addChild(item)
+                elif lower_half:
+                    dest.insertChild(dest.childCount(), item)
+                else:
+                    dest.insertChild(0, item)
+                dest.setExpanded(True)
+            else:
+                return False
+            holder = item.parent()
+            item.setData(0, Qt.ItemDataRole.UserRole + 2,
+                         None if holder is None
+                         else holder.data(0, Qt.ItemDataRole.UserRole + 1))
+        else:
+            return False
+        return True
+
+    def dropEvent(self, event) -> None:
+        if not self._internal_drag(event):
+            event.ignore()
+            return
+
+        item = self.selectedItems()[0]
+        position = event.position().toPoint()
+        target = self.itemAt(position)
+        if target is None:
+            event.ignore()
+            return
+
+        rect = self.visualItemRect(target)
+        lower_half = position.y() > rect.center().y()
+        on_item = (position.y() >= rect.top() + rect.height() // 4
+                   and position.y() < rect.top()
+                   + (rect.height() * 3) // 4)
+
+        if not self._move_item(item, target, lower_half, on_item):
+            event.ignore()
+            return
+
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        self.setCurrentItem(item)
+        QTimer.singleShot(0, self.orderChanged.emit)
+
 class ScribblePanel(QWidget):
     """The pen's settings, the layers, and what the document holds."""
 
@@ -3327,6 +4032,7 @@ class ScribblePanel(QWidget):
         super().__init__()
         self.app = app
         self._loading = False
+        self._refresh_pending = False
         layout = QVBoxLayout(self)
 
         # ---- Presets -------------------------------------------------------
@@ -3351,11 +4057,6 @@ class ScribblePanel(QWidget):
         layout.addLayout(preset_row)
 
         tool_row = QHBoxLayout()
-        self.select_btn = QPushButton("Selection")
-        self.select_btn.setToolTip("Click or fence marks to select before editing")
-        self.select_btn.clicked.connect(
-            lambda _c=False: self._take(ScribbleSelectTool))
-        tool_row.addWidget(self.select_btn)
         self.draw_btn = QPushButton("Pen")
         self.brush_btn = QPushButton("Brush")
         self.shape_btn = QPushButton("Shapes")
@@ -3374,6 +4075,19 @@ class ScribblePanel(QWidget):
             lambda on: _ERASER_MODE.update(partial=bool(on)))
         tool_row.addWidget(self.partial_erase)
         layout.addLayout(tool_row)
+
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("Trace speed:"))
+        self.trace_speed = QSpinBox()
+        self.trace_speed.setRange(0, 100)
+        self.trace_speed.setSuffix(" %")
+        self.trace_speed.setValue(int(_TRACE["speed"]))
+        self.trace_speed.setToolTip(
+            "Higher values filter small hand movements for straighter Pen "
+            "and Brush strokes")
+        self.trace_speed.valueChanged.connect(self._on_trace_speed)
+        speed_row.addWidget(self.trace_speed, 1)
+        layout.addLayout(speed_row)
 
         # ---- Pen -----------------------------------------------------------
         pen_row = QHBoxLayout()
@@ -3412,6 +4126,11 @@ class ScribblePanel(QWidget):
             "Slow, smooth slack-cord waves; 0 keeps the line taut")
         turbulence_row.addWidget(self.turbulence, 1)
         layout.addLayout(turbulence_row)
+
+        pen_brush_separator = QFrame()
+        pen_brush_separator.setFrameShape(QFrame.Shape.HLine)
+        pen_brush_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(pen_brush_separator)
 
         # ---- Brush ---------------------------------------------------------
         # The brush is its own tool: a halo, not a pen with a big width.
@@ -3511,6 +4230,11 @@ class ScribblePanel(QWidget):
         self.brush_alpha.valueChanged.connect(self._on_brush_alpha)
         brush_alpha.addWidget(self.brush_alpha, 1)
         layout.addLayout(brush_alpha)
+
+        brush_shape_separator = QFrame()
+        brush_shape_separator.setFrameShape(QFrame.Shape.HLine)
+        brush_shape_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(brush_shape_separator)
 
         # ---- Shapes --------------------------------------------------------
         shape_row = QHBoxLayout()
@@ -3648,10 +4372,22 @@ class ScribblePanel(QWidget):
 
         transform_row = QHBoxLayout()
         transform_row.addWidget(QLabel("Transform:"))
+        self.select_btn = QPushButton("Selection")
+        self.select_btn.setToolTip(
+            "Click a drawing in the tree or fence drawings to select")
+        self.select_btn.clicked.connect(
+            lambda _c=False: self._take(ScribbleSelectTool))
+        transform_row.addWidget(self.select_btn)
         self.move_btn = QPushButton("Move")
         self.move_btn.setToolTip("Drag a mark or fence several marks to select them")
         self.move_btn.clicked.connect(lambda _c=False: self._take(ScribbleMoveTool))
         transform_row.addWidget(self.move_btn)
+        self.point_edit_btn = QPushButton("Edit Points")
+        self.point_edit_btn.setToolTip(
+            "Select one drawing in Layers, window its points, then drag to move them")
+        self.point_edit_btn.clicked.connect(
+            lambda _c=False: self._take(ScribblePointEditTool))
+        transform_row.addWidget(self.point_edit_btn)
         for text, mode in (("Rotate…", "rotate"), ("Scale…", "scale"),
                            ("Mirror H", "mirror_h"), ("Mirror V", "mirror_v")):
             button = QPushButton(text)
@@ -3661,24 +4397,68 @@ class ScribblePanel(QWidget):
             transform_row.addWidget(button)
         layout.addLayout(transform_row)
 
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("View:"))
+        self.zoom_extents_btn = QPushButton("Zoom Extents")
+        self.zoom_extents_btn.setToolTip(
+            "Frame all visible Croquis annotations")
+        self.zoom_extents_btn.clicked.connect(
+            lambda _c=False: self._zoom_extents())
+        view_row.addWidget(self.zoom_extents_btn)
+        self.zoom_object_btn = QPushButton("Zoom Object")
+        self.zoom_object_btn.setToolTip(
+            "Frame the selected drawing(s) from Layers")
+        self.zoom_object_btn.clicked.connect(
+            lambda _c=False: self._zoom_object())
+        view_row.addWidget(self.zoom_object_btn)
+        self.zoom_window_btn = QPushButton("Zoom Window")
+        self.zoom_window_btn.setToolTip(
+            "Drag a rectangle in the viewport to zoom into it")
+        self.zoom_window_btn.clicked.connect(
+            lambda _c=False: self._take(ScribbleZoomWindowTool))
+        view_row.addWidget(self.zoom_window_btn)
+        layout.addLayout(view_row)
+
         self.state = QLabel()
         self.state.setWordWrap(True)
         layout.addWidget(self.state)
 
         # ---- Layers --------------------------------------------------------
         layout.addWidget(QLabel("Layers (bottom to top):"))
-        self.layers = QListWidget()
-        self.layers.setMaximumHeight(140)
-        self.layers.currentRowChanged.connect(self._on_layer_row)
+        self.layers = _StrokeOrderTree()
+        self.layers.setToolTip(
+            "Drawings are listed top to bottom. Drag a drawing above or below "
+            "another in the same or another layer to change stacking order or "
+            "move it between layers. Use Shift "
+            "for a selection range, Ctrl to toggle drawings, or press Delete "
+            "to remove selected drawings.")
+        self.layers.setHeaderHidden(True)
+        self.layers.setMinimumHeight(140)
+        self.layers.setDragEnabled(True)
+        self.layers.setAcceptDrops(True)
+        self.layers.setDropIndicatorShown(True)
+        self.layers.setDragDropMode(
+            QAbstractItemView.DragDropMode.DragDrop)
+        self.layers.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.layers.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.layers.currentItemChanged.connect(self._on_tree_item)
+        self.layers.itemSelectionChanged.connect(
+            self._on_tree_selection_changed)
+        self.layers.orderChanged.connect(self._on_tree_order_changed)
         self.layers.itemChanged.connect(self._on_layer_item)
+        self.delete_strokes_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Delete), self.layers)
+        self.delete_strokes_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.delete_strokes_shortcut.activated.connect(
+            self._delete_selected_strokes)
         layout.addWidget(self.layers)
 
         layer_buttons = QHBoxLayout()
         for text, slot, tip in (
             ("+", self._add_layer, "New layer above the active one"),
             ("−", self._remove_layer, "Delete the active layer"),
-            ("↑", lambda: self._move_layer(1), "Move the layer up"),
-            ("↓", lambda: self._move_layer(-1), "Move the layer down"),
             ("Rename", self._rename_layer, "Rename the active layer"),
             ("Lock", self._lock_layer, "Lock or unlock the active layer"),
         ):
@@ -3686,6 +4466,12 @@ class ScribblePanel(QWidget):
             button.setToolTip(tip)
             button.clicked.connect(lambda _c=False, s=slot: s())
             layer_buttons.addWidget(button)
+        self.recolor_btn = QPushButton("Recolor…")
+        self.recolor_btn.setToolTip(
+            "Change the outline and fill colours of selected drawings")
+        self.recolor_btn.clicked.connect(
+            lambda _c=False: self._recolor_selected())
+        layer_buttons.addWidget(self.recolor_btn)
         layout.addLayout(layer_buttons)
 
         opacity_row = QHBoxLayout()
@@ -3743,7 +4529,8 @@ class ScribblePanel(QWidget):
         layout.addWidget(self.sheet_note)
 
         hint = QLabel(
-            "Selection: click a mark or drag a fence to select it first. Pen and "
+            "Selection: click a mark, choose it under Layers, or drag a fence "
+            "to select it first. Pen and "
             "Brush: press, drag and release. Shapes: click to anchor, click "
             "again to finish (drag to size; the arc takes three points, the "
             "polyline ends on a double click). Shift constrains to 45°, Alt "
@@ -3751,10 +4538,19 @@ class ScribblePanel(QWidget):
             "layer. Move drags a mark, or drags a fence on empty space to "
             "carry several (Shift adds to the fence; Shift on a mark takes "
             "its whole layer). Use the Partial erase checkbox to cut only the "
-            "swept segment. Use the Combine and Transform controls on the "
-            "Move selection. Select a drawing plane for fixed depth, toggle its "
+            "swept segment. Toggle a layer or a drawing in the tree to control "
+            "its visibility. Select a drawing in Layers and press Delete to "
+            "remove it (Ctrl+Z to undo). Use the Combine and Transform "
+            "controls on the Move selection. Edit Points selects vertices "
+            "inside a window; drag again to move them, or Shift-drag to add "
+            "vertices. Recolor changes the outline and fill of selected "
+            "drawings. Zoom Extents frames visible annotations; Zoom Window "
+            "frames a viewport rectangle; Zoom Object frames the selected "
+            "drawing(s). Select a drawing plane for fixed "
+            "depth, toggle its "
             "visibility, and set Pen turbulence from 0% for a steady line to "
-            "100% for a stronger wobble. Brush, colour and fill apply to new "
+            "100% for a stronger wobble. Trace speed filters small movements "
+            "for straighter Pen and Brush strokes. Brush, colour and fill apply to new "
             "strokes.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -3809,9 +4605,15 @@ class ScribblePanel(QWidget):
         elif kind == "ScribbleMoveTool":
             text = ("Move ready — drag a mark or fence a selection; use the "
                     "Transform and Combine controls for selected marks.")
+        elif kind == "ScribblePointEditTool":
+            text = ("Edit Points ready — select one drawing in Layers, drag a "
+                    "window over its points, then drag again to move them. "
+                    "Shift-drag adds points.")
+        elif kind == "ScribbleZoomWindowTool":
+            text = "Zoom Window ready — drag a rectangle in the viewport."
         else:
             text = ("No Croquis on model tool in the hand: press Selection, "
-                    "Pen, Brush, Shapes, Erase or Move.")
+                    "Pen, Brush, Shapes, Erase, Move or Zoom Window.")
         if self.state.text() != text:
             self.state.setText(text)
             self.select_btn.setDefault(kind == "ScribbleSelectTool")
@@ -3820,6 +4622,59 @@ class ScribblePanel(QWidget):
             self.shape_btn.setDefault(kind == "ScribbleShapeTool")
             self.erase_btn.setDefault(kind == "ScribbleEraserTool")
             self.move_btn.setDefault(kind == "ScribbleMoveTool")
+            self.point_edit_btn.setDefault(kind == "ScribblePointEditTool")
+            self.zoom_window_btn.setDefault(kind == "ScribbleZoomWindowTool")
+
+    def _zoom_extents(self) -> None:
+        try:
+            _zoom_extents(self.app, self.app.viewport)
+        except Exception as exc:  # noqa: BLE001 — surfaced in the viewport
+            _fail(self.app.viewport, exc)
+
+    def _zoom_object(self) -> None:
+        _zoom_object_action(self.app)
+
+    def _recolor_selected(self) -> None:
+        viewport = self.app.viewport
+        scene = getattr(viewport, "scene", None)
+        if (scene is None or _SELECTION["scene"] != id(scene)
+                or not _SELECTION["ids"]):
+            self.sheet_note.setText("Select one or more drawings to recolor.")
+            return
+        doc = document(self.app, scene)
+        selected = []
+        for layer in doc["layers"]:
+            for stroke in layer["strokes"]:
+                if stroke["id"] in _SELECTION["ids"]:
+                    selected.append((layer, stroke))
+        if not selected:
+            self.sheet_note.setText("The selected drawings no longer exist.")
+            return
+        if any(layer["locked"] for layer, _stroke in selected):
+            self.sheet_note.setText("Unlock the selected layer(s) before recoloring.")
+            return
+        color = QColorDialog.getColor(
+            QColor(_PEN["color"]), self, "Croquis on model — recolor")
+        if not color.isValid():
+            return
+        replacement = color.name()
+        for _layer, stroke in selected:
+            stroke["c"] = replacement
+            stroke["fc"] = replacement
+            stroke["fc2"] = replacement
+            if stroke.get("c2"):
+                stroke["c2"] = replacement
+        try:
+            _store(self.app, doc)
+        except Exception as exc:  # noqa: BLE001 — reported in the panel
+            self.sheet_note.setText(
+                f"Could not recolor the selected drawings: "
+                f"{type(exc).__name__}: {exc}")
+            return
+        viewport.update()
+        self.sheet_note.setText(
+            f"Recolored {len(selected)} drawing"
+            f"{'s' if len(selected) != 1 else ''}.")
 
     def _erase_all(self) -> None:
         doc = document(self.app)
@@ -3849,7 +4704,8 @@ class ScribblePanel(QWidget):
         if layer["locked"] or not layer["visible"]:
             self.sheet_note.setText("The active layer is hidden or locked.")
             return
-        selected = [st for st in layer["strokes"] if st["id"] in tool._sel]
+        selected = [st for st in _visible_strokes(layer)
+                    if st["id"] in tool._sel]
         result, error = _boolean_combine(selected, operation)
         if error:
             self.sheet_note.setText(error)
@@ -3857,6 +4713,8 @@ class ScribblePanel(QWidget):
         ids = {st["id"] for st in selected}
         layer["strokes"] = [st for st in layer["strokes"]
                             if st["id"] not in ids]
+        result.pop("name", None)
+        _name_stroke(layer, result)
         layer["strokes"].append(result)
         tool._sel = {result["id"]}
         _store(self.app, doc)
@@ -4032,28 +4890,167 @@ class ScribblePanel(QWidget):
         _store(self.app, doc)
         self.refresh()
 
-    def _on_layer_row(self, row: int) -> None:
-        if self._loading or row < 0:
+    def _on_tree_item(self, item, _previous) -> None:
+        if self._loading or item is None:
             return
-        item = self.layers.item(row)
-        if item is None:
+        item_type = item.data(0, Qt.ItemDataRole.UserRole)
+        if item_type == "layer":
+            _POINT_SELECTION.update(scene=None, stroke=None, indices=set())
+            _ACTIVE["id"] = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            self._sync_opacity()
+        elif item_type == "stroke":
+            layer_id = item.data(0, Qt.ItemDataRole.UserRole + 2)
+            _ACTIVE["id"] = layer_id
+            self._sync_opacity()
+            if not isinstance(getattr(self.app.viewport, "active_tool", None),
+                              ScribbleMoveTool):
+                self._take(ScribbleSelectTool)
+        else:
             return
-        _ACTIVE["id"] = item.data(Qt.ItemDataRole.UserRole)
-        self._sync_opacity()
+        self.app.viewport.update()
+
+    def _on_tree_selection_changed(self) -> None:
+        if self._loading:
+            return
+        selected_ids = {
+            item.data(0, Qt.ItemDataRole.UserRole + 1)
+            for item in self.layers.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole) == "stroke"
+        }
+        current = self.layers.currentItem()
+        current_is_stroke = (
+            current is not None
+            and current.data(0, Qt.ItemDataRole.UserRole) == "stroke")
+        if not selected_ids and not current_is_stroke:
+            return
+        scene = getattr(self.app, "scene", None)
+        _SELECTION.update(scene=id(scene) if scene is not None else None,
+                          ids=selected_ids)
+        _POINT_SELECTION.update(scene=None, stroke=None, indices=set())
+        if selected_ids and not isinstance(
+                getattr(self.app.viewport, "active_tool", None),
+                ScribbleMoveTool):
+            self._take(ScribbleSelectTool)
+        self.app.viewport.update()
+
+    def _on_tree_order_changed(self) -> None:
+        doc = self._doc()
+        layer_by_id = {layer["id"]: layer for layer in doc["layers"]}
+        strokes_by_id = {stroke["id"]: stroke
+                         for layer in doc["layers"]
+                         for stroke in layer["strokes"]}
+
+        tree_layers = {}
+        for index in range(self.layers.topLevelItemCount()):
+            item = self.layers.topLevelItem(index)
+            if (item is None
+                    or item.data(0, Qt.ItemDataRole.UserRole) != "layer"):
+                return
+            layer_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            if layer_id not in layer_by_id:
+                return
+            tree_layers[layer_id] = [
+                item.child(i).data(0, Qt.ItemDataRole.UserRole + 1)
+                for i in range(item.childCount())
+                if (item.child(i) is not None
+                    and item.child(i).data(0, Qt.ItemDataRole.UserRole)
+                    == "stroke")
+            ]
+
+        if set(tree_layers.keys()) != set(layer_by_id.keys()):
+            return
+        all_tree_ids = set()
+        for ids in tree_layers.values():
+            all_tree_ids.update(ids)
+        if all_tree_ids != set(strokes_by_id):
+            return
+
+        changed = False
+        new_layer_order = [layer_by_id[lid] for lid in tree_layers]
+        if ([layer["id"] for layer in new_layer_order]
+                != [layer["id"] for layer in doc["layers"]]):
+            doc["layers"] = new_layer_order
+            changed = True
+
+        for layer in doc["layers"]:
+            lid = layer["id"]
+            new_strokes = [strokes_by_id[sid] for sid in
+                           reversed(tree_layers[lid])
+                           if sid in strokes_by_id]
+            if [s["id"] for s in new_strokes] != [s["id"]
+                                                  for s in layer["strokes"]]:
+                layer["strokes"] = new_strokes
+                changed = True
+        if changed:
+            _store(self.app, doc)
+            self.app.viewport.update()
 
     def _on_layer_item(self, item) -> None:
         if self._loading:
             return
-        layer_id = item.data(Qt.ItemDataRole.UserRole)
+        item_type = item.data(0, Qt.ItemDataRole.UserRole)
+        if item_type == "layer":
+            layer_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        elif item_type == "stroke":
+            layer_id = item.data(0, Qt.ItemDataRole.UserRole + 2)
+        else:
+            return
         doc = self._doc()
         for lay in doc["layers"]:
             if lay["id"] == layer_id:
-                visible = item.checkState() == Qt.CheckState.Checked
-                if lay["visible"] != visible:
+                visible = (item.checkState(0)
+                           == Qt.CheckState.Checked)
+                if item_type == "layer":
+                    if lay["visible"] == visible:
+                        break
                     lay["visible"] = visible
-                    _store(self.app, doc)
-                    self.app.viewport.update()
+                else:
+                    stroke_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+                    stroke = next((st for st in lay["strokes"]
+                                   if st["id"] == stroke_id), None)
+                    if stroke is None or stroke.get("visible", True) == visible:
+                        break
+                    stroke["visible"] = visible
+                _store(self.app, doc)
+                self.app.viewport.update()
                 break
+
+    def _delete_selected_strokes(self) -> None:
+        targets = {}
+        for item in self.layers.selectedItems():
+            if item.data(0, Qt.ItemDataRole.UserRole) != "stroke":
+                continue
+            layer_id = item.data(0, Qt.ItemDataRole.UserRole + 2)
+            stroke_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            targets.setdefault(layer_id, set()).add(stroke_id)
+        if not targets:
+            return
+
+        doc = self._doc()
+        deleted = set()
+        removed = 0
+        for layer in doc["layers"]:
+            stroke_ids = targets.get(layer["id"])
+            if not stroke_ids:
+                continue
+            original = len(layer["strokes"])
+            layer["strokes"] = [stroke for stroke in layer["strokes"]
+                                if stroke["id"] not in stroke_ids]
+            removed += original - len(layer["strokes"])
+            deleted.update(stroke_ids)
+        if not removed:
+            return
+
+        scene = getattr(self.app, "scene", None)
+        if scene is not None and _SELECTION["scene"] == id(scene):
+            _SELECTION["ids"].difference_update(deleted)
+        if _POINT_SELECTION["stroke"] in deleted:
+            _POINT_SELECTION.update(scene=None, stroke=None, indices=set())
+        _store(self.app, doc)
+        self.app.viewport.update()
+        self.sheet_note.setText(
+            f"Deleted {removed} drawing{'s' if removed != 1 else ''}. "
+            "Press Ctrl+Z to undo.")
 
     def _on_opacity(self, value: int) -> None:
         if self._loading:
@@ -4303,6 +5300,9 @@ class ScribblePanel(QWidget):
     def _on_turbulence(self, value: int) -> None:
         _PEN["turbulence"] = max(0.0, min(1.0, value / 100.0))
 
+    def _on_trace_speed(self, value: int) -> None:
+        _TRACE["speed"] = max(0, min(100, int(value)))
+
     def _on_shape(self, _index: int) -> None:
         _SHAPE["kind"] = str(self.shape.currentData() or "line")
         self._sync_state()
@@ -4327,25 +5327,67 @@ class ScribblePanel(QWidget):
         _SHOW["visible"] = bool(on)
         self.app.viewport.update()
 
+    def schedule_refresh(self) -> None:
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        QTimer.singleShot(0, self._finish_scheduled_refresh)
+
+    def _finish_scheduled_refresh(self) -> None:
+        self._refresh_pending = False
+        self.refresh()
+
     # ---- Refresh -----------------------------------------------------------
     def _rebuild_layers(self) -> None:
         doc = self._doc()
         layer = active_layer(doc)
+        scene = getattr(self.app, "scene", None)
+        selected_ids = (_SELECTION["ids"]
+                        if scene is not None and _SELECTION["scene"] == id(scene)
+                        else set())
+        selected_item = None
         self._loading = True
         try:
             self.layers.clear()
-            for i, lay in enumerate(doc["layers"]):
+            for lay in doc["layers"]:
                 name = lay["name"]
                 if lay["locked"]:
                     name += "  (locked)"
-                item = QListWidgetItem(name)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setData(Qt.ItemDataRole.UserRole, lay["id"])
-                item.setCheckState(Qt.CheckState.Checked if lay["visible"]
+                item = QTreeWidgetItem([name])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                              | Qt.ItemFlag.ItemIsDropEnabled
+                              | Qt.ItemFlag.ItemIsDragEnabled)
+                item.setData(0, Qt.ItemDataRole.UserRole, "layer")
+                item.setData(0, Qt.ItemDataRole.UserRole + 1, lay["id"])
+                item.setCheckState(0, Qt.CheckState.Checked if lay["visible"]
                                    else Qt.CheckState.Unchecked)
-                self.layers.addItem(item)
-                if lay["id"] == layer["id"]:
-                    self.layers.setCurrentRow(i)
+                self.layers.addTopLevelItem(item)
+                for stroke in reversed(lay["strokes"]):
+                    child = QTreeWidgetItem([stroke["name"]])
+                    child.setFlags(
+                        child.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                        | Qt.ItemFlag.ItemIsDropEnabled
+                        | Qt.ItemFlag.ItemIsDragEnabled)
+                    child.setData(0, Qt.ItemDataRole.UserRole, "stroke")
+                    child.setData(0, Qt.ItemDataRole.UserRole + 1,
+                                  stroke["id"])
+                    child.setData(0, Qt.ItemDataRole.UserRole + 2, lay["id"])
+                    child.setCheckState(
+                        0, Qt.CheckState.Checked
+                        if stroke.get("visible", True)
+                        else Qt.CheckState.Unchecked)
+                    item.addChild(child)
+                    if stroke["id"] in selected_ids:
+                        child.setSelected(True)
+                        if lay["id"] == layer["id"]:
+                            selected_item = child
+                if lay["id"] == layer["id"] and selected_item is None:
+                    selected_item = item
+                item.setExpanded(True)
+            if selected_item is not None:
+                self.layers.setCurrentItem(
+                    selected_item, 0,
+                    QItemSelectionModel.SelectionFlag.NoUpdate)
         finally:
             self._loading = False
         self._sync_opacity()
@@ -4377,14 +5419,16 @@ class ScribblePanel(QWidget):
 # ---------------------------------------------------------------------------
 
 def _overlay(app, viewport, painter: QPainter) -> None:
-    """Every visible layer of the project in front, over the frame."""
-    if not _SHOW["visible"]:
-        return
-    doc = document(app, viewport.scene)
-    if not any(lay["visible"] and lay["strokes"] for lay in doc["layers"]):
-        return
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    _paint_layers(painter, viewport, doc)
+    """Paint annotations, then the active tool preview above them."""
+    if _SHOW["visible"]:
+        doc = document(app, viewport.scene)
+        if any(lay["visible"] and _visible_strokes(lay)
+               for lay in doc["layers"]):
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            _paint_layers(painter, viewport, doc)
+    tool = getattr(viewport, "active_tool", None)
+    if isinstance(tool, _StickyTool):
+        tool.draw_preview(viewport, painter)
 
 
 def _drawing_plane_overlay(app, viewport, painter: QPainter) -> None:
@@ -4436,9 +5480,9 @@ def setup(app) -> None:
     _APP = app
     panel = ScribblePanel(app)
     dock = app.add_panel(TITLE, panel)
-    app.on_document_changed(panel.refresh)
-    app.add_overlay(lambda vp, painter: _overlay(app, vp, painter))
+    app.on_document_changed(panel.schedule_refresh)
     app.add_overlay(lambda vp, painter: _drawing_plane_overlay(app, vp, painter))
+    app.add_overlay(lambda vp, painter: _overlay(app, vp, painter))
 
     method = _register_sheet(app)
     try:
@@ -4467,6 +5511,22 @@ def setup(app) -> None:
             "Croquis on model — Move",
             lambda: _take_tool(app, ScribbleMoveTool),
             tip="Drag a mark, or fence several, and move them together.")
+        app.add_menu_action(
+            "Croquis on model — Edit Points",
+            lambda: _take_tool(app, ScribblePointEditTool),
+            tip="Window-select points on one drawing and drag to move them.")
+        app.add_menu_action(
+            "Croquis on model — Zoom Extents",
+            lambda: _zoom_extents_action(app),
+            tip="Frame all visible Croquis annotations.")
+        app.add_menu_action(
+            "Croquis on model — Zoom Object",
+            lambda: _zoom_object_action(app),
+            tip="Frame the selected Croquis drawing(s).")
+        app.add_menu_action(
+            "Croquis on model — Zoom Window",
+            lambda: _take_tool(app, ScribbleZoomWindowTool),
+            tip="Drag a viewport rectangle to zoom into it.")
         app.add_menu_action(
             "Croquis on model — Export PNG…", lambda: export_png(app),
             tip="Write the annotations to a PNG image.")
