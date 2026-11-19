@@ -4378,16 +4378,16 @@ class ScribblePanel(QWidget):
         self.select_btn.clicked.connect(
             lambda _c=False: self._take(ScribbleSelectTool))
         transform_row.addWidget(self.select_btn)
-        self.move_btn = QPushButton("Move")
-        self.move_btn.setToolTip("Drag a mark or fence several marks to select them")
-        self.move_btn.clicked.connect(lambda _c=False: self._take(ScribbleMoveTool))
-        transform_row.addWidget(self.move_btn)
         self.point_edit_btn = QPushButton("Edit Points")
         self.point_edit_btn.setToolTip(
             "Select one drawing in Layers, window its points, then drag to move them")
         self.point_edit_btn.clicked.connect(
             lambda _c=False: self._take(ScribblePointEditTool))
         transform_row.addWidget(self.point_edit_btn)
+        self.move_btn = QPushButton("Move")
+        self.move_btn.setToolTip("Drag a mark or fence several marks to select them")
+        self.move_btn.clicked.connect(lambda _c=False: self._take(ScribbleMoveTool))
+        transform_row.addWidget(self.move_btn)
         for text, mode in (("Rotate…", "rotate"), ("Scale…", "scale"),
                            ("Mirror H", "mirror_h"), ("Mirror V", "mirror_v")):
             button = QPushButton(text)
