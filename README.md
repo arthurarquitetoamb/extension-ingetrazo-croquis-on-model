@@ -7,7 +7,8 @@ Strokes are stored in the project in world coordinates. Each stroke is drawn
 on the plane facing the camera at the point where it began, so the marks stay
 with the model as you orbit the view.
 
-<img width="461" height="447" alt="Croqui" src="https://github.com/user-attachments/assets/956efac5-ef54-4c38-8eca-92a17ec69c5c" />
+<img width="235" height="339" alt="croquis" src="https://github.com/user-attachments/assets/801b941e-8c22-463c-955d-2e916aa9befa" />
+
 
 ## Why freehand drawing in a modeling environment?
 
